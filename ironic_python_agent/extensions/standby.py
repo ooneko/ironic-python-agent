@@ -16,6 +16,7 @@ import hashlib
 import os
 import tempfile
 import time
+import urllib
 from urllib import parse as urlparse
 
 from ironic_lib import disk_utils
@@ -265,6 +266,97 @@ def _message_format(msg, image_info, device, partition_uuids):
     return message
 
 
+class ImageDownloadFast(object):
+    """Download image use wget
+    """
+
+    def __init__(self, image_info, time_obj=None):
+        """Initialize an instance of the ImageDownload class.
+
+        Trys each URL in image_info successively until a URL returns a
+        successful request code. Once the object is initialized, the user may
+        retrieve chunks of the image through the standard python iterator
+        interface until either the image is fully downloaded, or an error is
+        encountered.
+
+        :param image_info: Image information dictionary.
+        :param time_obj: Optional time object to indicate when the image
+                         download began. Defaults to None. If None, then
+                         time.time() will be used to find the start time of
+                         the download.
+
+        :raises: ImageDownloadError if starting the image download fails for
+                 any reason.
+        """
+        self._time = time_obj or time.time()
+        self._last_chunk_time = None
+        self._image_info = image_info
+
+        # Determine the hash algorithm and value will be used for calculation
+        # and verification, fallback to md5 if algorithm is not set or not
+        # supported.
+        algo = image_info.get('os_hash_algo')
+        if algo and algo in hashlib.algorithms_available:
+            self._hash_algo = hashlib.new(algo)
+            self._expected_hash_value = image_info.get('os_hash_value')
+        elif image_info.get('checksum'):
+            try:
+                self._hash_algo = hashlib.md5()
+            except ValueError as e:
+                message = ('Unable to proceed with image {} as the legacy '
+                           'checksum indicator has been used, which makes use '
+                           'the MD5 algorithm. This algorithm failed to load '
+                           'due to the underlying operating system. Error: '
+                           '{}').format(image_info['id'], str(e))
+                LOG.error(message)
+                raise errors.RESTError(details=message)
+            self._expected_hash_value = image_info['checksum']
+        else:
+            message = ('Unable to verify image {} with available checksums. '
+                       'Please make sure the specified \'os_hash_algo\' '
+                       '(currently {}) is supported by this ramdisk, or '
+                       'provide a md5 checksum via the \'checksum\' '
+                       'field'.format(image_info['id'],
+                                      image_info.get('os_hash_algo')))
+            LOG.error(message)
+            raise errors.RESTError(details=message)
+
+        self._expected_hash_value = _fetch_checksum(self._expected_hash_value,
+                                                    image_info)
+
+    def download(self, location):
+        for url in self._image_info['urls']:
+            try:
+                urllib.urlretrieve(self.url, filename=location)
+            except Exception as e:
+                raise errors.ImageDownloadError(self._image_info['id'], e.msg)
+            else:
+                break
+
+    def verify_image(self, image_location):
+        """Verifies the checksum of the local images matches expectations.
+
+        If this function does not raise ImageChecksumError then it is very
+        likely that the local copy of the image was transmitted and stored
+        correctly.
+
+        :param image_location: The location of the local image.
+        :raises: ImageChecksumError if the checksum of the local image does
+                 not match the checksum as reported by glance in image_info.
+        """
+        checksum = hashlib.md5(image_location).hexdigest()
+        LOG.debug('Verifying image at {} against {} checksum '
+                  '{}'.format(image_location, self._hash_algo.name, checksum))
+        if checksum != self._expected_hash_value:
+            LOG.error(errors.ImageChecksumError.details_str.format(
+                image_location, self._image_info['id'],
+                self._expected_hash_value, checksum))
+            raise errors.ImageChecksumError(image_location,
+                                            self._image_info['id'],
+                                            self._expected_hash_value,
+                                            checksum)
+
+
 class ImageDownload(object):
     """Helper class that opens a HTTP connection to download an image.
 
@@ -399,6 +491,41 @@ class ImageDownload(object):
                                             checksum)
 
 
+def _download_image_fast(image_info):
+    """Downloads the specified image to the local file system via wget.
+
+    :param image_info: Image information dictionary.
+    :raises: ImageDownloadError if the image download fails for any reason.
+    :raises: ImageChecksumError if the downloaded image's checksum does not
+             match the one reported in image_info.
+    """
+    starttime = time.time()
+    image_location = _image_location(image_info)
+    for attempt in range(CONF.image_download_connection_retries + 1):
+        try:
+            image_download = ImageDownloadFast(
+                image_info, time_obj=starttime)
+            image_download.download(image_location)
+
+        except errors.ImageDownloadError as e:
+            if attempt == CONF.image_download_connection_retries:
+                raise
+            else:
+                LOG.warning('Image download failed, %(attempt)s of %(total)s: '
+                            '%(error)s',
+                            {'attempt': attempt,
+                             'total': CONF.image_download_connection_retries,
+                             'error': e})
+                time.sleep(CONF.image_download_connection_retry_interval)
+        else:
+            break
+
+    totaltime = time.time() - starttime
+    LOG.info("Image downloaded from {} in {} seconds".format(image_location,
+                                                             totaltime))
+    image_download.verify_image(image_location)
+
+
 def _download_image(image_info):
     """Downloads the specified image to the local file system.
 
@@ -530,6 +657,7 @@ def _validate_partitioning(device):
 
 class StandbyExtension(base.BaseAgentExtension):
     """Extension which adds stand-by related functionality to agent."""
+
     def __init__(self, agent=None):
         """Constructs an instance of StandbyExtension.
 
@@ -552,7 +680,7 @@ class StandbyExtension(base.BaseAgentExtension):
                   match the one reported in image_info.
         :raises: ImageWriteError if writing the image fails.
         """
-        _download_image(image_info)
+        _download_image_fast(image_info)
         self.partition_uuids = _write_image(image_info, device)
         self.cached_image_id = image_info['id']
 
